@@ -138,13 +138,13 @@ def compute_boundary_uncertainty(
         return u
         
     n_sub = A_sub.shape[0]
-    row = np.repeat(n_sub, len(periphery_idx))
-    col = periphery_idx
-    data = np.ones(len(periphery_idx))
-    
-    A_sub_augmented = sp.vstack([A_sub, sp.csr_matrix((1, n_sub))])
-    A_dummy_col = sp.csr_matrix((np.append(data, 0), (np.append(row, n_sub), np.append(col, n_sub))), shape=(n_sub + 1, 1))
-    A_sub_augmented = sp.hstack([A_sub_augmented, A_dummy_col])
+    # Build an explicit (n_sub + 1) x (n_sub + 1) augmented graph with a dummy
+    # node connected to every low-degree periphery node.
+    A_sub_augmented = sp.lil_matrix((n_sub + 1, n_sub + 1), dtype=A_sub.dtype)
+    A_sub_augmented[:n_sub, :n_sub] = A_sub
+    A_sub_augmented[periphery_idx, n_sub] = 1
+    A_sub_augmented[n_sub, periphery_idx] = 1
+    A_sub_augmented = A_sub_augmented.tocsr()
     
     dist_matrix = shortest_path(csgraph=A_sub_augmented, directed=False, indices=n_sub, unweighted=True)
     d_i = dist_matrix[:n_sub]
