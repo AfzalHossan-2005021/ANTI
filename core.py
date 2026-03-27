@@ -2,6 +2,7 @@ import os
 import ot
 import time
 import torch
+import warnings
 import datetime
 import numpy as np
 import pandas as pd
@@ -237,18 +238,77 @@ def compute_community_anchors(
 # STFA PIPELINE: STAGE 3 (Bilevel Gamma Calibration)
 # =====================================================================
 
+def _normalize_cost_matrix(M: np.ndarray) -> np.ndarray:
+    M = np.asarray(M, dtype=float)
+    M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+    min_val = np.min(M)
+    if min_val < 0:
+        M = M - min_val
+    max_val = np.max(M)
+    if max_val > 0:
+        M = M / max_val
+    return M
+
+def _sanitize_distribution(weights: np.ndarray) -> np.ndarray:
+    weights = np.asarray(weights, dtype=float).copy()
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    weights[weights < 0] = 0.0
+    total = weights.sum()
+    if total <= 0:
+        return np.ones_like(weights) / len(weights)
+    return weights / total
+
+def _ensure_nonempty_mask(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool).copy()
+    if not np.any(mask):
+        mask[np.random.randint(len(mask))] = True
+    return mask
+
 def solve_unbalanced_fgw(
     C1: np.ndarray, C2: np.ndarray, M: np.ndarray, 
     p: np.ndarray, q: np.ndarray, 
     gamma: float, alpha: float, 
     reg: float = 0.01
 ) -> np.ndarray:
-    try:
-        pi = ot.gromov.entropic_fused_gromov_wasserstein(
-            M, C1, C2, p, q, loss_fun='square_loss', epsilon=reg, alpha=alpha, numItermax=50
-        )
-    except Exception:
-        pi = np.outer(p, q)
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    active_p = p > 0
+    active_q = q > 0
+
+    if not np.any(active_p) or not np.any(active_q):
+        return np.outer(_sanitize_distribution(p), _sanitize_distribution(q))
+
+    C1_sub = _normalize_cost_matrix(C1[np.ix_(active_p, active_p)])
+    C2_sub = _normalize_cost_matrix(C2[np.ix_(active_q, active_q)])
+    M_sub = _normalize_cost_matrix(M[np.ix_(active_p, active_q)])
+    p_sub = _sanitize_distribution(p[active_p])
+    q_sub = _sanitize_distribution(q[active_q])
+
+    reg_candidates = sorted({max(float(reg), 0.05), 0.1, 0.2})
+    pi_sub = None
+
+    for epsilon in reg_candidates:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message=".*numerical errors.*")
+                warnings.filterwarnings("error", message=".*failed to produce a transport plan.*")
+                warnings.filterwarnings("error", category=RuntimeWarning)
+                candidate = ot.gromov.entropic_fused_gromov_wasserstein(
+                    M_sub, C1_sub, C2_sub, p_sub, q_sub,
+                    loss_fun='square_loss', epsilon=epsilon, alpha=alpha, numItermax=100
+                )
+            if np.all(np.isfinite(candidate)) and candidate.sum() > 0:
+                pi_sub = np.maximum(candidate, 0.0)
+                pi_sub /= pi_sub.sum()
+                break
+        except Exception:
+            continue
+
+    if pi_sub is None:
+        pi_sub = np.outer(p_sub, q_sub)
+
+    pi = np.zeros_like(M, dtype=float)
+    pi[np.ix_(active_p, active_q)] = pi_sub
     return pi
 
 def compute_bilevel_gamma_calibration(
@@ -269,15 +329,19 @@ def compute_bilevel_gamma_calibration(
     p_sub = np.ones(N_sub) / N_sub
     q_sub = np.ones(N_sub) / N_sub
     
-    dropout_A = np.random.rand(N_sub) > 0.05
-    dropout_B = np.random.rand(N_sub) > 0.05
+    dropout_A = _ensure_nonempty_mask(np.random.rand(N_sub) > 0.05)
+    dropout_B = _ensure_nonempty_mask(np.random.rand(N_sub) > 0.05)
     
     def evaluate_gamma(g: float) -> float:
         M_sub = g * M_g_sub + (1 - g) * M_t_sub + 0.1 * M_a_sub
         pi_base = solve_unbalanced_fgw(C1_sub, C2_sub, M_sub, p_sub, q_sub, g, alpha)
         
-        p_drop = p_sub.copy(); p_drop[~dropout_A] = 0; p_drop /= p_drop.sum()
-        q_drop = q_sub.copy(); q_drop[~dropout_B] = 0; q_drop /= q_drop.sum()
+        p_drop = p_sub.copy()
+        q_drop = q_sub.copy()
+        p_drop[~dropout_A] = 0
+        q_drop[~dropout_B] = 0
+        p_drop = _sanitize_distribution(p_drop)
+        q_drop = _sanitize_distribution(q_drop)
         
         pi_drop = solve_unbalanced_fgw(C1_sub, C2_sub, M_sub, p_drop, q_drop, g, alpha)
         diff = pi_base[np.ix_(dropout_A, dropout_B)] - pi_drop[np.ix_(dropout_A, dropout_B)]
